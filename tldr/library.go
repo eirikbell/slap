@@ -6,45 +6,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eirikbell/slap/magic"
 	"github.com/pkg/errors"
 )
 
-// Lend details on books lended to customer
-type Lend struct {
-	BookID           string
-	CustomerID       int
-	LatestReturnDate time.Time
-}
-
-// Book unique book in library
-type Book struct {
-	ID          string
-	CurrentLend *Lend
-	DayPenalty  int
-}
-
-// Customer unique customer of library
-type Customer struct {
-	ID       int
-	IsLocked bool
-	Age      int
-}
-
-// LibraryService the sacred service provided by consultants back in the days
-type LibraryService interface {
-	GetBook(string) *Book
-	GetOldDbBooks() []*Book
-	GetCustomer(int) (*Customer, error)
-	GetLendsForCustomer(int) ([]*Book, error)
-	CollectPayment(int, int) error
-	SaveBook(*Book) error
-}
-
 // LendBook handles the transaction of lending a book to a customer
-func LendBook(bID string, cID int, lib LibraryService) error {
+func LendBook(bID string, cID int, lib magic.LibraryService) error {
 	bidlen := len(bID)
 
-	var b *Book
+	var b *magic.Book
 	// Check book is lendable
 	if bidlen < 5 {
 		b = nil
@@ -88,18 +58,18 @@ func LendBook(bID string, cID int, lib LibraryService) error {
 		return errors.Wrap(err, "Cannot retrieve current lends")
 	}
 	// Used to be more
-	if len(cl) > 3 {
+	if len(cl) >= 3 {
 		if !renewal {
 			return fmt.Errorf("Customer already has %d lended books, 3 is the limit", len(cl))
 		}
 
 		// Trying to bring down outstanding books, but allow renewal
-		if len(cl) > 4 {
+		if len(cl) >= 4 {
 			return fmt.Errorf("Cannot renew when more than 3 other books are lended, customer already has %d lended books", len(cl))
 		}
 	}
 
-	nonreturned := []*Book{}
+	nonreturned := []*magic.Book{}
 	for _, l := range cl {
 		if l.CurrentLend.LatestReturnDate.Before(time.Now()) {
 			nonreturned = append(nonreturned, l)
@@ -150,6 +120,17 @@ func LendBook(bID string, cID int, lib LibraryService) error {
 	if renewal {
 		d := time.Now().AddDate(0, 0, 7)
 		b.CurrentLend.LatestReturnDate = d
+		// Must manually refund
+		if err := lib.SaveBook(b); err != nil {
+			return errors.Wrap(err, "Renewal failed")
+		}
+	} else {
+		d := time.Now().AddDate(0, 0, 7)
+		b.CurrentLend = &magic.Lend{
+			CustomerID:       cID,
+			BookID:           bID,
+			LatestReturnDate: d,
+		}
 		// Must manually refund
 		if err := lib.SaveBook(b); err != nil {
 			return errors.Wrap(err, "Renewal failed")
