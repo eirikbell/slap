@@ -6,15 +6,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eirikbell/slap/magic"
+	"github.com/eirikbell/slap/servicelib"
 	"github.com/pkg/errors"
 )
 
 // LendBook handles the transaction of lending a book to a customer
-func LendBook(bID string, cID int, lib magic.LibraryService) error {
+func LendBook(bID string, cID int, lib servicelib.LibraryService) error {
 	bidlen := len(bID)
 
-	var b *magic.Book
+	var b *servicelib.Book
 	// Check book is lendable
 	if bidlen < 5 {
 		b = nil
@@ -69,7 +69,7 @@ func LendBook(bID string, cID int, lib magic.LibraryService) error {
 		}
 	}
 
-	nonreturned := []*magic.Book{}
+	nonreturned := []*servicelib.Book{}
 	for _, l := range cl {
 		if l.CurrentLend.LatestReturnDate.Before(time.Now()) {
 			nonreturned = append(nonreturned, l)
@@ -94,7 +94,7 @@ func LendBook(bID string, cID int, lib magic.LibraryService) error {
 		if tot > 0 {
 			if c.Age < 18 {
 				// 50% less if not adult
-				tot = tot / 2
+				tot = int(math.Ceil(float64(tot) / float64(2)))
 			}
 			err := lib.CollectPayment(cID, tot)
 			if err != nil {
@@ -126,14 +126,14 @@ func LendBook(bID string, cID int, lib magic.LibraryService) error {
 		}
 	} else {
 		d := time.Now().AddDate(0, 0, 7)
-		b.CurrentLend = &magic.Lend{
+		b.CurrentLend = &servicelib.Lend{
 			CustomerID:       cID,
 			BookID:           bID,
 			LatestReturnDate: d,
 		}
-		// Must manually refund
+		// Lend registration failed
 		if err := lib.SaveBook(b); err != nil {
-			return errors.Wrap(err, "Renewal failed")
+			return errors.Wrap(err, "Lend failed")
 		}
 	}
 

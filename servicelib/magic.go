@@ -1,4 +1,4 @@
-package magic
+package servicelib
 
 import "time"
 
