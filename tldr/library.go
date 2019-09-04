@@ -63,7 +63,7 @@ func LendBook(bID string, cID int, lib servicelib.LibraryService) error {
 			return fmt.Errorf("Customer already has %d lended books, 3 is the limit", len(cl))
 		}
 
-		// Trying to bring down outstanding books, but allow renewal
+		// Trying to bring down outstanding books, but allow renewal if 3 other outstanding books
 		if len(cl) >= 4 {
 			return fmt.Errorf("Cannot renew when more than 3 other books are lended, customer already has %d lended books", len(cl))
 		}

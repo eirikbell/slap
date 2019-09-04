@@ -10,6 +10,40 @@ import (
 	"github.com/pkg/errors"
 )
 
+// LendBook handles the transaction of lending a book to a customer
+func LendBook(bookID string, customerID int, libraryService servicelib.LibraryService) error {
+	book, isRenewal, err := findBookDetails(bookID, customerID, libraryService)
+	if err != nil {
+		return err
+	}
+
+	customer, err := findActiveCustomer(customerID, libraryService)
+	if err != nil {
+		return err
+	}
+
+	err = handleReturns(customer, isRenewal, libraryService)
+	if err != nil {
+		return err
+	}
+
+	return lendOrRenewBook(customer, book, isRenewal, libraryService)
+}
+
+func findBookDetails(bookID string, customerID int, libraryService servicelib.LibraryService) (*servicelib.Book, bool, error) {
+	book, err := findBook(bookID, libraryService)
+	if err != nil {
+		return nil, false, err
+	}
+
+	isRenewal, err := isisRenewal(book, customerID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return book, isRenewal, nil
+}
+
 func findBook(bookID string, libraryService servicelib.LibraryService) (*servicelib.Book, error) {
 	var b *servicelib.Book
 	// Check book is lendable
@@ -32,7 +66,7 @@ func findBook(bookID string, libraryService servicelib.LibraryService) (*service
 	return nil, fmt.Errorf("Book not found")
 }
 
-func isRenewal(book *servicelib.Book, customerID int) (bool, error) {
+func isisRenewal(book *servicelib.Book, customerID int) (bool, error) {
 	if book.CurrentLend != nil {
 		if book.CurrentLend.CustomerID != customerID {
 			return false, fmt.Errorf("Book is currently lended to customer %d", book.CurrentLend.CustomerID)
@@ -43,18 +77,13 @@ func isRenewal(book *servicelib.Book, customerID int) (bool, error) {
 	return false, nil
 }
 
-func findBookDetails(bookID string, customerID int, libraryService servicelib.LibraryService) (*servicelib.Book, bool, error) {
-	book, err := findBook(bookID, libraryService)
+func handleReturns(customer *servicelib.Customer, isRenewal bool, libraryService servicelib.LibraryService) error {
+	notReturnedBookLends, err := getNotReturnedBookLends(customer, isRenewal, libraryService)
 	if err != nil {
-		return nil, false, err
+		return err
 	}
 
-	renewal, err := isRenewal(book, customerID)
-	if err != nil {
-		return nil, false, err
-	}
-
-	return book, renewal, nil
+	return collectPayment(customer, notReturnedBookLends, libraryService)
 }
 
 func findActiveCustomer(customerID int, libraryService servicelib.LibraryService) (*servicelib.Customer, error) {
@@ -70,148 +99,151 @@ func findActiveCustomer(customerID int, libraryService servicelib.LibraryService
 	return customer, nil
 }
 
-func handleReturns(customer *servicelib.Customer, nonreturned []*servicelib.Book, libraryService servicelib.LibraryService) error {
-	if len(nonreturned) > 0 {
-		// Not allowed by law to collect payment if customer is younger than 13
-		if customer.Age < 13 {
-			return fmt.Errorf("Cannot collect payment for %d books, customer is younger than 13", len(nonreturned))
+func getNotReturnedBookLends(customer *servicelib.Customer, isRenewal bool, libraryService servicelib.LibraryService) ([]*servicelib.Book, error) {
+	bookLends, err := libraryService.GetLendsForCustomer(customer.ID)
+	if err != nil {
+		return nil, errors.Wrap(err, "Cannot retrieve current lends")
+	}
+
+	if err := validateLendingLimitNotExceeded(bookLends, isRenewal); err != nil {
+		return nil, err
+	}
+
+	return filterNotReturnedBookLends(bookLends), nil
+}
+
+func validateLendingLimitNotExceeded(bookLends []*servicelib.Book, isRenewal bool) error {
+	// Used to be more
+	if len(bookLends) >= 3 {
+		if !isRenewal {
+			return fmt.Errorf("Customer already has %d lended books, 3 is the limit", len(bookLends))
 		}
 
-		tot := 0
-		for _, nr := range nonreturned {
-			late := time.Since(nr.CurrentLend.LatestReturnDate)
-			days := int(math.Ceil(late.Hours() / 24))
-
-			price := days * nr.DayPenalty
-			tot += price
+		// Trying to bring down outstanding books, but allow renewal if 3 other outstanding books
+		if len(bookLends) >= 4 {
+			return fmt.Errorf("Cannot renew when more than 3 other books are lended, customer already has %d lended books", len(bookLends))
 		}
-		if tot > 0 {
-			if customer.Age < 18 {
-				// 50% less if not adult
-				tot = int(math.Ceil(float64(tot) / float64(2)))
-			}
-			err := libraryService.CollectPayment(customer.ID, tot)
-			if err != nil {
-				return errors.Wrap(err, "Payment failed")
-			}
+	}
+	return nil
+}
 
-			fail := []string{}
-			for _, nr := range nonreturned {
-				d := time.Now().AddDate(0, 0, 7)
-				nr.CurrentLend.LatestReturnDate = d
-				// Must manually register later
-				if err := libraryService.SaveBook(nr); err != nil {
-					fail = append(fail, nr.ID)
-				}
-			}
-			if len(fail) > 0 {
-				return fmt.Errorf("Saving extended date failed, manually register extension for customer %d on books %s", customer.ID, strings.Join(fail, ", "))
-			}
+func filterNotReturnedBookLends(bookLends []*servicelib.Book) []*servicelib.Book {
+	notReturnedBookLends := []*servicelib.Book{}
+	for _, l := range bookLends {
+		if l.CurrentLend.LatestReturnDate.Before(time.Now()) {
+			notReturnedBookLends = append(notReturnedBookLends, l)
 		}
+	}
+	return notReturnedBookLends
+}
+
+func collectPayment(customer *servicelib.Customer, notReturnedBookLends []*servicelib.Book, libraryService servicelib.LibraryService) error {
+	if len(notReturnedBookLends) == 0 {
+		return nil
+	}
+
+	if err := canCollectPayment(customer, notReturnedBookLends); err != nil {
+		return err
+	}
+
+	return payAndRenewBookLends(customer, notReturnedBookLends, libraryService)
+}
+
+func canCollectPayment(customer *servicelib.Customer, bookLends []*servicelib.Book) error {
+	// Not allowed by law to collect payment if customer is younger than 13
+	if customer.Age < 13 {
+		return fmt.Errorf("Cannot collect payment for %d books, customer is younger than 13", len(bookLends))
+	}
+	return nil
+}
+
+func payAndRenewBookLends(customer *servicelib.Customer, bookLends []*servicelib.Book, libraryService servicelib.LibraryService) error {
+	priceToPay := calculateTotalPriceForLateReturn(customer, bookLends)
+
+	if priceToPay > 0 {
+		if err := libraryService.CollectPayment(customer.ID, priceToPay); err != nil {
+			return errors.Wrap(err, "Payment failed")
+		}
+
+		if err := renewBookLends(customer, bookLends, libraryService); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func calculateTotalPriceForLateReturn(customer *servicelib.Customer, bookLends []*servicelib.Book) int {
+	tot := 0
+	for _, nr := range bookLends {
+		price := calculatePriceForLateReturn(nr)
+		tot += price
+	}
+	if customer.Age < 18 {
+		// 50% less if not adult
+		tot = int(math.Ceil(float64(tot) / float64(2)))
+	}
+	return tot
+}
+
+func calculatePriceForLateReturn(book *servicelib.Book) int {
+	late := time.Since(book.CurrentLend.LatestReturnDate)
+	days := int(math.Ceil(late.Hours() / 24))
+
+	return days * book.DayPenalty
+}
+
+func renewBookLends(customer *servicelib.Customer, bookLends []*servicelib.Book, libraryService servicelib.LibraryService) error {
+	fail := []string{}
+	for _, book := range bookLends {
+		setBookLendLatestReturnDate(book.CurrentLend)
+		// Must manually register later
+		if err := libraryService.SaveBook(book); err != nil {
+			fail = append(fail, book.ID)
+		}
+	}
+	if len(fail) > 0 {
+		return fmt.Errorf("Saving extended date failed, manually register extension for customer %d on books %s", customer.ID, strings.Join(fail, ", "))
+	}
+	return nil
+}
+
+func lendOrRenewBook(customer *servicelib.Customer, book *servicelib.Book, isRenewal bool, libraryService servicelib.LibraryService) error {
+	if isRenewal {
+		return renewBook(book, libraryService)
+	}
+
+	return lendBook(book, customer.ID, libraryService)
+}
+
+func lendBook(book *servicelib.Book, customerID int, libraryService servicelib.LibraryService) error {
+	book.CurrentLend = createBookLend(customerID, book.ID)
+	// Lend registration failed
+	if err := libraryService.SaveBook(book); err != nil {
+		return errors.Wrap(err, "Lend failed")
 	}
 
 	return nil
 }
 
-// LendBook handles the transaction of lending a book to a customer
-func LendBook(bookID string, customerID int, lib servicelib.LibraryService) error {
-	b, renewal, err := findBookDetails(bookID, customerID, lib)
-	if err != nil {
-		return err
+func renewBook(book *servicelib.Book, libraryService servicelib.LibraryService) error {
+	setBookLendLatestReturnDate(book.CurrentLend)
+	// Must manually refund
+	if err := libraryService.SaveBook(book); err != nil {
+		return errors.Wrap(err, "Renewal failed")
 	}
-
-	c, err := findActiveCustomer(customerID, lib)
-	if err != nil {
-		return err
-	}
-
-	// Prerequisites for lend
-	cl, err := lib.GetLendsForCustomer(customerID)
-	if err != nil {
-		return errors.Wrap(err, "Cannot retrieve current lends")
-	}
-	// Used to be more
-	if len(cl) >= 3 {
-		if !renewal {
-			return fmt.Errorf("Customer already has %d lended books, 3 is the limit", len(cl))
-		}
-
-		// Trying to bring down outstanding books, but allow renewal
-		if len(cl) >= 4 {
-			return fmt.Errorf("Cannot renew when more than 3 other books are lended, customer already has %d lended books", len(cl))
-		}
-	}
-
-	nonreturned := []*servicelib.Book{}
-	for _, l := range cl {
-		if l.CurrentLend.LatestReturnDate.Before(time.Now()) {
-			nonreturned = append(nonreturned, l)
-		}
-	}
-
-	// Collect payment for missing return
-	if err := handleReturns(c, nonreturned, lib); err != nil {
-		return err
-	}
-	// if len(nonreturned) > 0 {
-	// 	// Not allowed by law to collect payment if customer is younger than 13
-	// 	if c.Age < 13 {
-	// 		return fmt.Errorf("Cannot collect payment for %d books, customer is younger than 13", len(nonreturned))
-	// 	}
-
-	// 	tot := 0
-	// 	for _, nr := range nonreturned {
-	// 		late := time.Since(nr.CurrentLend.LatestReturnDate)
-	// 		days := int(math.Ceil(late.Hours() / 24))
-
-	// 		price := days * nr.DayPenalty
-	// 		tot += price
-	// 	}
-	// 	if tot > 0 {
-	// 		if c.Age < 18 {
-	// 			// 50% less if not adult
-	// 			tot = int(math.Ceil(float64(tot) / float64(2)))
-	// 		}
-	// 		err := lib.CollectPayment(customerID, tot)
-	// 		if err != nil {
-	// 			return errors.Wrap(err, "Payment failed")
-	// 		}
-
-	// 		fail := []string{}
-	// 		for _, nr := range nonreturned {
-	// 			d := time.Now().AddDate(0, 0, 7)
-	// 			nr.CurrentLend.LatestReturnDate = d
-	// 			// Must manually register later
-	// 			if err := lib.SaveBook(nr); err != nil {
-	// 				fail = append(fail, nr.ID)
-	// 			}
-	// 		}
-	// 		if len(fail) > 0 {
-	// 			return fmt.Errorf("Saving extended date failed, manually register extension for customer %d on books %s", customerID, strings.Join(fail, ", "))
-	// 		}
-	// 	}
-	// }
-
-	// Create book lending
-	if renewal {
-		d := time.Now().AddDate(0, 0, 7)
-		b.CurrentLend.LatestReturnDate = d
-		// Must manually refund
-		if err := lib.SaveBook(b); err != nil {
-			return errors.Wrap(err, "Renewal failed")
-		}
-	} else {
-		d := time.Now().AddDate(0, 0, 7)
-		b.CurrentLend = &servicelib.Lend{
-			CustomerID:       customerID,
-			BookID:           bookID,
-			LatestReturnDate: d,
-		}
-		// Lend registration failed
-		if err := lib.SaveBook(b); err != nil {
-			return errors.Wrap(err, "Lend failed")
-		}
-	}
-
 	return nil
+}
+
+func createBookLend(customerID int, bookID string) *servicelib.Lend {
+	lend := &servicelib.Lend{
+		CustomerID: customerID,
+		BookID:     bookID,
+	}
+	setBookLendLatestReturnDate(lend)
+	return lend
+}
+
+func setBookLendLatestReturnDate(lend *servicelib.Lend) {
+	d := time.Now().AddDate(0, 0, 7)
+	lend.LatestReturnDate = d
 }
